@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from app.schemas import IncidentRequest
-from app.services.diagnostics import analyze_incident
+from app.services.investigator import investigate
 
 app = FastAPI(
     title="BLACK BOX AI",
@@ -28,17 +28,4 @@ def health_check():
 
 @app.post("/incidents/investigate")
 def investigate_incident(incident: IncidentRequest):
-    diagnosis = analyze_incident(incident)
-
-    return {
-        "incident_title": incident.title,
-        "status": "analyzed",
-        "evidence_summary": {
-            "description": incident.description,
-            "log_count": len(incident.logs),
-            "error_rate": incident.error_rate,
-            "latency_ms": incident.latency_ms,
-            "recent_deployment": incident.recent_deployment,
-        },
-        "diagnosis": diagnosis,
-    }
+    return investigate(incident)
