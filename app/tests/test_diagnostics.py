@@ -54,3 +54,27 @@ def test_healthy_incident_produces_no_hypotheses():
 
     assert result["hypothesis_count"] == 0
     assert result["investigation_status"] == "insufficient_evidence"
+
+
+def test_hypotheses_include_verification_details():
+    incident = IncidentRequest(
+        title="Database connection failures",
+        description="Requests are failing due to database connection timeouts.",
+        logs=[
+            "ERROR: Database connection timeout",
+            "WARNING: Connection pool limit reached",
+        ],
+        error_rate=25.0,
+        latency_ms=1800.0,
+        recent_deployment=False,
+    )
+
+    result = analyze_incident(incident)
+
+    assert result["hypothesis_count"] > 0
+
+    for hypothesis in result["hypotheses"]:
+        assert hypothesis["verification_status"] == "unverified"
+        assert "supporting_evidence" in hypothesis
+        assert "missing_evidence" in hypothesis
+        assert len(hypothesis["missing_evidence"]) > 0

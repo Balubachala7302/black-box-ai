@@ -7,6 +7,7 @@ from app.services.diagnostic_tools import (
     inspect_deployment,
 )
 from app.services.diagnostics import analyze_incident
+from app.services.verification import verify_hypotheses
 
 
 def investigate(incident: IncidentRequest) -> dict[str, Any]:
@@ -44,21 +45,31 @@ def investigate(incident: IncidentRequest) -> dict[str, Any]:
     # Step 3: Generate candidate root-cause hypotheses.
     diagnosis = analyze_incident(incident)
 
-    # Step 4: Return findings with their supporting evidence.
+
+    # Step 4: Verify hypotheses against collected evidence.
+    evidence = {
+        "logs": log_evidence,
+        "metrics": metric_evidence,
+        "deployment": deployment_evidence,
+    }
+
+    verified_hypotheses = verify_hypotheses(
+        diagnosis["hypotheses"],
+        evidence,
+    )
+
+    # Step 5: Return findings and verification results.
     return {
         "incident_title": incident.title,
         "investigation_status": diagnosis["investigation_status"],
-        "evidence": {
-            "logs": log_evidence,
-            "metrics": metric_evidence,
-            "deployment": deployment_evidence,
-        },
-        "hypotheses": diagnosis["hypotheses"],
-        "hypothesis_count": diagnosis["hypothesis_count"],
+        "evidence": evidence,
+        "hypotheses": verified_hypotheses,
+        "hypothesis_count": len(verified_hypotheses),
         "investigation_trace": investigation_trace,
         "limitations": [
-            "Investigation currently uses rule-based diagnostic tools.",
-            "Hypotheses have not been independently verified.",
+            "Diagnostic tools currently use rule-based checks.",
+            "Verification statuses indicate evidence support, not confirmed root causes.",
+            "Database-side metrics and historical deployment comparisons are not yet integrated.",
             "Thresholds are fixed and are not learned from historical data.",
         ],
     }
