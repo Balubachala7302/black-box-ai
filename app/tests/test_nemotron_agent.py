@@ -1,131 +1,251 @@
-from types import SimpleNamespace
-from unittest.mock import Mock
 
-import pytest
+import json
+import os
+
+from dotenv import load_dotenv
+from openai import OpenAI
 
 from app.schemas import IncidentRequest
-from app.services import nemotron_agent
+from app.services.diagnostic_tools import (
+    inspect_logs,
+    inspect_metrics,
+    inspect_deployment,
+)
+from app.services.diagnostics import analyze_incident
+from app.services.verification import verify_hypotheses
+
+load_dotenv()
+
+MODEL = "nvidia/nemotron-3-super-120b-a12b"
+MAX_TOOL_CALLS = 4
+
+api_key = os.getenv("NEBIUS_API_KEY")
+
+client = (
+    OpenAI(
+        api_key=api_key,
+        base_url="https://api.tokenfactory.nebius.com/v1/",
+        timeout=30.0,
+        max_retries=0,
+    )
+    if api_key
+    else None
+)
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_logs",
+            "description": "Search incident logs for known error patterns.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_metrics",
+            "description": "Check the incident error rate and latency.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_deployment",
+            "description": "Check whether a recent deployment may be relevant.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+]
+
+TOOL_FUNCTIONS = {
+    "inspect_logs": inspect_logs,
+    "inspect_metrics": inspect_metrics,
+    "inspect_deployment": inspect_deployment,
+}
 
 
-def create_incident():
-    return IncidentRequest(
-        title="API errors increased after deployment",
-        description="The API is experiencing errors and slow responses.",
-        logs=["ERROR: Database connection timeout"],
-        error_rate=25.0,
-        latency_ms=1800.0,
-        recent_deployment=True,
+def _build_verified_evidence(incident: IncidentRequest) -> dict:
+    """Collect deterministic evidence and verify rule-based hypotheses."""
+
+    log_evidence = inspect_logs(incident)
+    metric_evidence = inspect_metrics(incident)
+    deployment_evidence = inspect_deployment(incident)
+
+    evidence = {
+        "logs": log_evidence,
+        "metrics": metric_evidence,
+        "deployment": deployment_evidence,
+    }
+
+    diagnosis = analyze_incident(incident)
+    hypotheses = verify_hypotheses(
+        diagnosis["hypotheses"],
+        evidence,
     )
 
-
-def make_response(content=None, tool_calls=None):
-    message = SimpleNamespace(
-        content=content,
-        tool_calls=tool_calls,
-    )
-
-    return SimpleNamespace(
-        choices=[
-            SimpleNamespace(message=message)
-        ]
-    )
+    return {
+        "evidence": evidence,
+        "hypotheses": hypotheses,
+        "hypothesis_count": len(hypotheses),
+        "investigation_status": diagnosis["investigation_status"],
+    }
 
 
-def test_agent_returns_final_analysis_without_tool_calls(monkeypatch):
-    monkeypatch.setattr(
-        nemotron_agent,
-        "client",
-        Mock(),
-    )
+def investigate_with_nemotron(
+    incident: IncidentRequest,
+) -> dict:
+    if client is None:
+        raise RuntimeError("NEBIUS_API_KEY is not configured.")
 
-    nemotron_agent.client.chat.completions.create.return_value = (
-        make_response(
-            content="Database connection saturation is a possible cause.",
-            tool_calls=None,
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are BLACK BOX AI, an evidence-driven software "
+                "incident investigator. Choose diagnostic tools based "
+                "on the evidence available. Never invent tool results. "
+                "Distinguish observations from hypotheses. A recent "
+                "deployment does not by itself prove causation. Explain "
+                "uncertainty and recommend safe next diagnostic steps."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Investigate this incident using the available tools. "
+                "Incident data:\n"
+                + json.dumps(incident.model_dump(), default=str)
+            ),
+        },
+    ]
+
+    trace = []
+    tool_calls_used = 0
+    executed_tools = set()
+
+    while tool_calls_used < MAX_TOOL_CALLS:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            max_tokens=700,
         )
-    )
 
-    result = nemotron_agent.investigate_with_nemotron(
-        create_incident()
-    )
+        message = response.choices[0].message
+        messages.append(message)
 
-    assert result["status"] == "completed"
-    assert result["tool_calls_used"] == 0
-    assert "Database connection saturation" in result["analysis"]
+        if not message.tool_calls:
+            verified = _build_verified_evidence(incident)
 
+            return {
+                "incident_title": incident.title,
+                "agent": MODEL,
+                "status": "completed",
+                "tool_calls_used": tool_calls_used,
+                "investigation_trace": trace,
+                "evidence": verified["evidence"],
+                "hypotheses": verified["hypotheses"],
+                "hypothesis_count": verified["hypothesis_count"],
+                "investigation_status": verified["investigation_status"],
+                "analysis": message.content or (
+                    "The model returned no final analysis."
+                ),
+                "limitations": [
+                    "Diagnostic tools currently use rule-based checks.",
+                    "Verification indicates evidence support, not a confirmed root cause.",
+                    "Database telemetry and historical deployment comparisons are not integrated.",
+                    "The rule-based evidence summary is computed independently of the model's narrative.",
+                ],
+            }
 
-def test_agent_executes_a_requested_diagnostic_tool(monkeypatch):
-    monkeypatch.setattr(
-        nemotron_agent,
-        "client",
-        Mock(),
-    )
+        for call in message.tool_calls:
+            if tool_calls_used >= MAX_TOOL_CALLS:
+                break
 
-    tool_call = SimpleNamespace(
-        id="call_123",
-        function=SimpleNamespace(
-            name="inspect_logs",
-            arguments="{}",
+            name = call.function.name
+
+            if name not in TOOL_FUNCTIONS:
+                result = {"error": "Tool is not allowed."}
+            elif name in executed_tools:
+                result = {
+                    "error": (
+                        "This diagnostic tool has already been executed "
+                        "for this incident. Use the collected evidence."
+                    )
+                }
+            else:
+                try:
+                    result = TOOL_FUNCTIONS[name](incident)
+                    executed_tools.add(name)
+                except Exception:
+                    result = {
+                        "error": "The diagnostic tool failed."
+                    }
+
+            tool_calls_used += 1
+
+            trace.append({
+                "step": tool_calls_used,
+                "tool": name,
+                "result": result,
+            })
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": json.dumps(result, default=str),
+            })
+
+    messages.append({
+        "role": "user",
+        "content": (
+            "The diagnostic tool-call limit has been reached. "
+            "Summarize only the evidence collected, state uncertainty, "
+            "and recommend the next safe diagnostic step. Do not "
+            "request more tools."
         ),
+    })
+
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        max_tokens=700,
     )
 
-    nemotron_agent.client.chat.completions.create.side_effect = [
-        make_response(
-            content=None,
-            tool_calls=[tool_call],
+    verified = _build_verified_evidence(incident)
+
+    return {
+        "incident_title": incident.title,
+        "agent": MODEL,
+        "status": "completed_with_tool_limit",
+        "tool_calls_used": tool_calls_used,
+        "investigation_trace": trace,
+        "evidence": verified["evidence"],
+        "hypotheses": verified["hypotheses"],
+        "hypothesis_count": verified["hypothesis_count"],
+        "investigation_status": verified["investigation_status"],
+        "analysis": response.choices[0].message.content or (
+            "The model returned no final analysis."
         ),
-        make_response(
-            content="The logs indicate possible database connection saturation.",
-            tool_calls=None,
-        ),
-    ]
-
-    result = nemotron_agent.investigate_with_nemotron(
-        create_incident()
-    )
-
-    assert result["status"] == "completed"
-    assert result["tool_calls_used"] == 1
-    assert result["investigation_trace"][0]["tool"] == "inspect_logs"
-
-
-def test_agent_handles_a_diagnostic_tool_failure(monkeypatch):
-    monkeypatch.setattr(
-        nemotron_agent,
-        "client",
-        Mock(),
-    )
-
-    tool_call = SimpleNamespace(
-        id="call_456",
-        function=SimpleNamespace(
-            name="inspect_logs",
-            arguments="{}",
-        ),
-    )
-
-    nemotron_agent.client.chat.completions.create.side_effect = [
-        make_response(
-            content=None,
-            tool_calls=[tool_call],
-        ),
-        make_response(
-            content="The diagnostic tool failed; further investigation is needed.",
-            tool_calls=None,
-        ),
-    ]
-
-    monkeypatch.setitem(
-        nemotron_agent.TOOL_FUNCTIONS,
-        "inspect_logs",
-        Mock(side_effect=RuntimeError("Simulated failure")),
-    )
-
-    result = nemotron_agent.investigate_with_nemotron(
-        create_incident()
-    )
-
-    assert result["tool_calls_used"] == 1
-    assert "failed" in str(
-        result["investigation_trace"][0]["result"]
-    ).lower()
+        "limitations": [
+            "Diagnostic tools currently use rule-based checks.",
+            "Verification indicates evidence support, not a confirmed root cause.",
+            "Database telemetry and historical deployment comparisons are not integrated.",
+            "The rule-based evidence summary is computed independently of the model's narrative.",
+        ],
+    }
