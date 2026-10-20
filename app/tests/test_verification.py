@@ -130,3 +130,80 @@ def test_recent_deployment_alone_does_not_support_regression():
         "before and after" in item.lower()
         for item in result[0]["missing_evidence"]
     )
+
+
+def test_latency_below_threshold_is_contradicted():
+    hypotheses = [
+        {
+            "cause": "Elevated application latency",
+            "confidence": 0.60,
+            "evidence": [],
+        }
+    ]
+    evidence = {
+        "logs": {"findings": []},
+        "metrics": {
+            "findings": [
+                {"metric": "latency_ms", "value": 200, "threshold": 1000}
+            ]
+        },
+        "deployment": {"recent_deployment": False},
+    }
+
+    result = verify_hypotheses(hypotheses, evidence)
+
+    assert result[0]["verification_status"] == "contradicted"
+    assert result[0]["contradictory_evidence"]
+
+
+def test_database_evidence_can_conflict_with_healthy_telemetry():
+    hypotheses = [
+        {
+            "cause": "Database connection saturation",
+            "confidence": 0.85,
+            "evidence": [],
+        }
+    ]
+    evidence = {
+        "logs": {
+            "findings": [
+                {
+                    "category": "database_connection_saturation",
+                    "matching_logs": ["Database connection timeout"],
+                }
+            ]
+        },
+        "metrics": {"findings": []},
+        "deployment": {"recent_deployment": False},
+        "database": {
+            "active_connections": 10,
+            "max_connections": 100,
+            "pool_waits": 0,
+        },
+    }
+
+    result = verify_hypotheses(hypotheses, evidence)
+
+    assert result[0]["verification_status"] == "conflicting"
+    assert result[0]["supporting_evidence"]
+    assert result[0]["contradictory_evidence"]
+
+
+def test_missing_database_telemetry_does_not_prove_contradiction():
+    hypotheses = [
+        {
+            "cause": "Database connection saturation",
+            "confidence": 0.85,
+            "evidence": [],
+        }
+    ]
+    evidence = {
+        "logs": {"findings": []},
+        "metrics": {"findings": []},
+        "deployment": {"recent_deployment": False},
+    }
+
+    result = verify_hypotheses(hypotheses, evidence)
+
+    assert result[0]["verification_status"] == "inconclusive"
+    assert result[0]["contradictory_evidence"] == []
