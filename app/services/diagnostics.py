@@ -1,23 +1,29 @@
+
 from app.schemas import IncidentRequest
 
 
 def analyze_incident(incident: IncidentRequest) -> dict:
-    """Generate explainable diagnostic hypotheses from incident evidence."""
+    """Generate explainable root-cause hypotheses from incident evidence.
+
+    These are heuristic candidates, not confirmed root causes.
+    Confidence values are provisional ranking scores, not probabilities.
+    """
 
     hypotheses = []
-    logs = "\n".join(incident.logs).lower()
+    logs = [log.lower() for log in incident.logs]
 
-    # Hypothesis 1: Database connection saturation
+    # 1. Database connection saturation
     database_patterns = (
         "database connection timeout",
         "connection pool limit",
         "too many connections",
+        "database connection exhausted",
     )
 
     database_evidence = [
-        log
-        for log in incident.logs
-        if any(pattern in log.lower() for pattern in database_patterns)
+        original
+        for original, normalized in zip(incident.logs, logs)
+        if any(pattern in normalized for pattern in database_patterns)
     ]
 
     if database_evidence:
@@ -34,13 +40,51 @@ def analyze_incident(incident: IncidentRequest) -> dict:
                     "Connection-pool wait and timeout metrics",
                 ],
                 "recommended_check": (
-                    "Inspect database connection-pool usage, "
-                    "active connections, and connection timeouts."
+                    "Inspect database connection-pool usage, active "
+                    "connections, and connection timeouts."
                 ),
             }
         )
 
-    # Hypothesis 2: Deployment-related regression
+    # 2. Upstream dependency failure
+    upstream_patterns = (
+        "upstream timeout",
+        "dependency timeout",
+        "service unavailable from dependency",
+        "upstream service unavailable",
+        "timeout calling payment provider",
+        "connection refused by upstream",
+    )
+
+    upstream_evidence = [
+        original
+        for original, normalized in zip(incident.logs, logs)
+        if any(pattern in normalized for pattern in upstream_patterns)
+    ]
+
+    if upstream_evidence:
+        hypotheses.append(
+            {
+                "cause": "Upstream dependency failure",
+                "confidence": 0.82,
+                "evidence": upstream_evidence,
+                "supporting_evidence": upstream_evidence,
+                "verification_status": "unverified",
+                "missing_evidence": [
+                    "Upstream dependency health and availability",
+                    "Dependency request latency and error rate",
+                    "Distributed traces showing the failing dependency",
+                    "Network and timeout metrics",
+                ],
+                "recommended_check": (
+                    "Check the dependency's health, request latency, "
+                    "error rate, and distributed traces."
+                ),
+            }
+        )
+
+    # 3. Deployment-related regression
+    # A recent deployment and elevated errors are correlation, not proof.
     if incident.recent_deployment and incident.error_rate >= 5:
         deployment_evidence = [
             "A recent deployment was reported.",
@@ -50,23 +94,27 @@ def analyze_incident(incident: IncidentRequest) -> dict:
         hypotheses.append(
             {
                 "cause": "Deployment-related regression",
-                "confidence": 0.70,
+                "confidence": 0.55,
                 "evidence": deployment_evidence,
-                "supporting_evidence": deployment_evidence,
+                "supporting_evidence": [],
                 "verification_status": "unverified",
                 "missing_evidence": [
-                    "Error rate before deployment",
-                    "Error rate after deployment",
+                    "Error rate before and after deployment",
                     "Deployment timestamp and release changes",
+                    "Evidence linking the changed code or configuration "
+                    "to the observed failures",
+                    "Comparison with a baseline or unaffected service",
                 ],
                 "recommended_check": (
-                    "Compare error rates before and after deployment "
-                    "and inspect the release changes."
+                    "Compare incident timing and error rates with the "
+                    "deployment timeline, release changes, and an "
+                    "unaffected baseline before attributing causation."
                 ),
             }
         )
 
-    # Hypothesis 3: Elevated application latency
+    # 4. Elevated application latency
+    # This detects a symptom; it does not identify its underlying cause.
     if incident.latency_ms >= 1000:
         latency_evidence = [
             f"Reported latency is {incident.latency_ms} ms."
@@ -77,21 +125,23 @@ def analyze_incident(incident: IncidentRequest) -> dict:
                 "cause": "Elevated application latency",
                 "confidence": 0.60,
                 "evidence": latency_evidence,
-                "supporting_evidence": latency_evidence,
+                "supporting_evidence": [],
                 "verification_status": "unverified",
                 "missing_evidence": [
                     "Historical latency baseline",
                     "Endpoint-level latency measurements",
-                    "Dependency response times and resource utilization",
+                    "Dependency response times",
+                    "CPU, memory, and connection-pool utilization",
                 ],
                 "recommended_check": (
-                    "Inspect endpoint latency, dependency response times, "
+                    "Compare latency against its historical baseline, "
+                    "then inspect endpoint timings, dependencies, "
                     "and resource utilization."
                 ),
             }
         )
 
-    # Rank hypotheses by provisional rule-based score
+    # Rank candidates by provisional score.
     hypotheses.sort(
         key=lambda hypothesis: hypothesis["confidence"],
         reverse=True,
@@ -106,9 +156,10 @@ def analyze_incident(incident: IncidentRequest) -> dict:
             else "insufficient_evidence"
         ),
         "note": (
-            "Confidence values are provisional rule-based scores, "
-            "not statistically calibrated probabilities. "
-            "All hypotheses remain unverified until additional "
-            "evidence is collected."
+            "These hypotheses are generated by fixed heuristic rules. "
+            "Scores are provisional ranking values, not calibrated "
+            "probabilities. A detected symptom or temporal correlation "
+            "does not establish a root cause. Collect and verify further "
+            "evidence before deciding on remediation."
         ),
     }
