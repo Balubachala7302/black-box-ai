@@ -40,7 +40,9 @@ def inspect_logs(
             "connection pool limit",
             "too many connections",
             "database connection exhausted",
-        ],
+            "database connection pool exhausted",
+            "connection pool exhausted",
+            ],
         "deployment_regression": [
             "deployment failed",
             "new release",
@@ -157,6 +159,7 @@ def inspect_logs(
 
 
 
+
 def inspect_metrics(
     incident: IncidentRequest,
     metrics: Optional[list[str]] = None,
@@ -178,7 +181,7 @@ def inspect_metrics(
         ),
     }
 
-    requested = set(metrics or available_metrics.keys())
+    requested = list(dict.fromkeys(metrics or available_metrics.keys()))
 
     for metric_name in requested:
         if metric_name not in available_metrics:
@@ -196,42 +199,13 @@ def inspect_metrics(
 
     return {
         "tool": "inspect_metrics",
-        "metrics_examined": list(
-            requested.intersection(available_metrics)
-        ),
+        "metrics_examined": [
+            name for name in requested
+            if name in available_metrics
+        ],
         "findings": findings,
     }
-
-
-    requested = set(metrics or available_metrics.keys())
-
-    for metric_name in requested:
-        if metric_name not in available_metrics:
-            continue
-
-        value, threshold, observation = available_metrics[metric_name]
-
-        if value >= threshold:
-            findings.append({
-                "metric": metric_name,
-                "value": value,
-                "threshold": threshold,
-                "observation": observation,
-            })
-        else:
-            findings.append({
-                "metric": metric_name,
-                "value": value,
-                "threshold": threshold,
-                "observation": "Metric is below the configured alert threshold.",
-            })
-
-    return {
-        "tool": "inspect_metrics",
-        "metrics_examined": list(requested.intersection(available_metrics)),
-        "findings": findings,
-    }
-
+    
 
 def inspect_deployment(
     incident: IncidentRequest,
@@ -252,4 +226,132 @@ def inspect_deployment(
         "focus": focus,
         "recent_deployment": incident.recent_deployment,
         "observation": observation,
+    }
+
+
+def inspect_traces(
+    incident: IncidentRequest,
+    query: Optional[str] = None,
+    service_name: Optional[str] = None,
+    errors_only: bool = False,
+    min_duration_ms: float = 1000,
+) -> dict[str, Any]:
+    """Inspect normalized OpenTelemetry traces."""
+
+    traces = [
+        item
+        for item in (incident.normalized_evidence or [])
+        if isinstance(item, dict)
+        and item.get("kind") == "trace"
+    ]
+
+    query_text = (
+        query.lower().strip()
+        if isinstance(query, str) and query.strip()
+        else None
+    )
+
+    service_filter = (
+        service_name.lower().strip()
+        if isinstance(service_name, str) and service_name.strip()
+        else None
+    )
+
+    matching_traces = []
+
+    for trace in traces:
+        attributes = trace.get("attributes") or {}
+        resource_attributes = trace.get("resource_attributes") or {}
+
+        current_service = (
+            trace.get("service_name")
+            or resource_attributes.get("service.name")
+            or attributes.get("service.name")
+            or "unknown_service"
+        )
+
+        if (
+            service_filter
+            and service_filter not in str(current_service).lower()
+        ):
+            continue
+
+        failed = trace.get("failed") is True
+
+        try:
+            duration = float(trace.get("duration_ms") or 0)
+        except (TypeError, ValueError):
+            duration = 0
+
+        slow = duration >= min_duration_ms
+
+        if errors_only and not failed:
+            continue
+
+        searchable_text = " ".join(
+            str(value)
+            for value in (
+                trace.get("name", ""),
+                trace.get("trace_id", ""),
+                trace.get("span_id", ""),
+                trace.get("parent_span_id", ""),
+                current_service,
+                attributes,
+                resource_attributes,
+                trace.get("status_message", ""),
+            )
+        ).lower()
+
+        if query_text and query_text not in searchable_text:
+            continue
+
+        if failed or slow:
+            evidence_status = (
+                "failed_and_slow"
+                if failed and slow
+                else "failed"
+                if failed
+                else "slow"
+            )
+        else:
+            evidence_status = "normal"
+
+        matching_traces.append({
+            "trace_id": trace.get("trace_id"),
+            "span_id": trace.get("span_id"),
+            "parent_span_id": trace.get("parent_span_id"),
+            "service_name": current_service,
+            "span_name": trace.get("name"),
+            "duration_ms": duration,
+            "status_code": trace.get("status_code"),
+            "status_message": trace.get("status_message"),
+            "failed": failed,
+            "slow": slow,
+            "evidence_status": evidence_status,
+            "attributes": attributes,
+        })
+
+    failed_spans = [
+        trace for trace in matching_traces
+        if trace["failed"]
+    ]
+
+    slow_spans = [
+        trace for trace in matching_traces
+        if trace["slow"]
+    ]
+
+    return {
+        "tool": "inspect_traces",
+        "query": query,
+        "service_name": service_name,
+        "errors_only": errors_only,
+        "min_duration_ms": min_duration_ms,
+        "total_spans_examined": len(traces),
+        "matching_spans": len(matching_traces),
+        "failed_span_count": len(failed_spans),
+        "slow_span_count": len(slow_spans),
+        "failed_spans": failed_spans,
+        "slow_spans": slow_spans,
+        "trace_evidence": matching_traces,
     }
