@@ -1,9 +1,13 @@
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.schemas import IncidentRequest
 from app.services.investigator import investigate
 from app.services import nemotron_agent
+import logging
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="BLACK BOX AI",
@@ -11,6 +15,16 @@ app = FastAPI(
     version="0.3.0",
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 def root():
@@ -39,11 +53,13 @@ def investigate_incident(
 
     try:
         return nemotron_agent.investigate_with_nemotron(incident)
+        
     except Exception:
+        logger.exception("Nemotron investigation failed")
         raise HTTPException(
             status_code=503,
             detail=(
                 "Nemotron investigation is currently unavailable. "
-                "Retry or use mode=baseline."
+                "Check the backend terminal for the underlying error."
             ),
         ) from None
